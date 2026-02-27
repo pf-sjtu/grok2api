@@ -548,9 +548,12 @@ class SQLStorage(BaseStorage):
     """
     SQL 数据库存储 (MySQL/PgSQL)
     - 使用 SQLAlchemy 异步引擎
-    - 自动 Schema 初始化
+    - 自动 Schema 初始化 (带 PostgreSQL Advisory Lock 防死锁)
     - 内置连接池 (QueuePool)
     """
+
+    # Advisory Lock ID 用于防止并发 DDL 死锁 (Serverless 环境下多个实例并发)
+    _SCHEMA_LOCK_ID: ClassVar[int] = 42_000_001
 
     def __init__(self, url: str, connect_args: dict | None = None):
         try:
@@ -576,7 +579,43 @@ class SQLStorage(BaseStorage):
         self._initialized = False
 
     async def _ensure_schema(self):
-        """确保数据库表存在"""
+        """确保数据库表存在（使用 Advisory Lock 防止并发 DDL 死锁）"""
+        if self._initialized:
+            return
+
+        from sqlalchemy import text
+
+        # PostgreSQL 使用 Advisory Lock 防止并发 DDL 死锁（Serverless 环境）
+        if self.dialect in ("postgres", "postgresql", "pgsql"):
+            async with self.engine.connect() as conn:
+                # 尝试获取排他性 Advisory Lock（非阻塞）
+                result = await conn.execute(
+                    text(f"SELECT pg_try_advisory_lock({self._SCHEMA_LOCK_ID})")
+                )
+                acquired = result.scalar()
+
+                if not acquired:
+                    # 其他实例正在执行，等待后检查初始化状态
+                    await asyncio.sleep(0.5)
+                    if self._initialized:
+                        return
+                    # 阻塞等待锁
+                    await conn.execute(
+                        text(f"SELECT pg_advisory_lock({self._SCHEMA_LOCK_ID})")
+                    )
+
+                try:
+                    await self._do_ensure_schema()
+                finally:
+                    await conn.execute(
+                        text(f"SELECT pg_advisory_unlock({self._SCHEMA_LOCK_ID})")
+                    )
+        else:
+            # 其他数据库使用原有逻辑
+            await self._do_ensure_schema()
+
+    async def _do_ensure_schema(self):
+        """实际执行 schema 初始化（被锁保护）"""
         if self._initialized:
             return
         try:
